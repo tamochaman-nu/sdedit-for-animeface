@@ -1,0 +1,4 @@
+# Dockerfile が使うのは requirements-animeface.txt だけ (リポジトリは実行時に /app へバインドマウントする)。
+# チェックポイント (ddpm/*.pt) や重みのキャッシュ、入出力をビルドの文脈に送らないよう、ほかはすべて除く
+*
+!requirements-animeface.txt

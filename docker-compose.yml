@@ -1,0 +1,224 @@
+# 実写の顔 (3DGS 用のマルチビュー画像) をアニメ顔の DDPM で SDEdit によりアニメ調に変換する実行環境。
+#
+#   docker compose build
+#   docker compose run --rm shell                # 対話シェル
+#   docker compose run --rm landmarks [opts]     # ① ランドマーク     /data/input -> /data/output/landmarks.json
+#   docker compose run --rm align [opts]         # ② 切り出し         -> /data/output/aligned/ (+ quads.json)
+#   docker compose run --rm parse [opts]         # ③ 顔パーシング     /data/output/aligned -> /data/output/parse/
+#   docker compose run --rm convert [opts]       # ④ 入力の加工 + ⑤ SDEdit  -> /data/output/convert/
+#   docker compose run --rm paste [opts]         # ⑥ 貼り戻し         -> /data/output/pasted/
+#   docker compose run --rm pipeline [opts]      # ① 〜 ⑥ の通し ([opts] は convert へ。他の段は LANDMARKS_OPTS などの環境変数)
+#   docker compose run --rm fit-color-stats [opts]  # 色の写像の統計の作り直し -> /data/output/face_color_stats.json
+#   docker compose run --rm verify <段> [opts]   # 回帰確認 (元リポジトリの出力と比べる。段: landmarks align parse cond sdedit paste)
+#   docker compose run --rm export-orig          # 元リポジトリのコードで ④ の float の入力を書き出す (回帰確認用)
+#
+# 別のシーンを変換するときは .env の HOST_INPUT_DIR と HOST_OUTPUT_DIR だけを変える (例: ./input/<シーン名>、./output/<シーン名>)。
+#
+# [opts] は各サービスの既定の引数の後ろに付く。同じオプションなら後ろが勝つ (argparse) ので上書きになる。例:
+#   docker compose run --rm convert --t0_ratio 0.4 --seed 1
+#   docker compose run --rm convert --out_dir /data/output/convert_t04 --t0_ratio 0.4
+# 必須の引数 (入出力とモデルのパス) は entrypoint に書き、command は空にしている (command に書くと [opts] で丸ごと置き換わるため)。
+# モデル・cfg・統計のパスは environment で渡し、entrypoint の中で展開する (-e MODEL_PATH=... でも変えられる)。
+#
+# ホスト側のパスは .env で指定する (ひな形と説明: .env.example)。リポジトリは /app にバインドマウントされるので、
+# コードを変えても再ビルドは不要。入出力のディレクトリは先に作っておく (無いと止まる。root 所有で作られるのを防ぐため)。
+#
+# コンテナ内のパス:
+#   /app          リポジトリ (ddpm/ のチェックポイントと cfg、lists/ の統計もここ)
+#   /data/input   シーンの入力フレーム (HOST_INPUT_DIR、読み取り専用)
+#   /data/output  全段の出力 (HOST_OUTPUT_DIR)。landmarks.json, aligned/, parse/, convert/, pasted/, verify/
+#   /home/app/.cache  重みのキャッシュ (HOST_CACHE_DIR。torch hub の 2DFAN4・s3fd、BiSeNet の resnet18.pt)
+#   /orig         回帰確認で参照する元リポジトリ (HOST_ORIG_REPO、読み取り専用。verify と export-orig だけ)
+
+x-runtime-env: &runtime-env
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  PYTHONDONTWRITEBYTECODE: "1"
+
+x-gpu: &gpu
+  shm_size: '8gb'
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            device_ids: ['${GPU_ID:-0}']
+            capabilities: [gpu]
+
+x-volumes:
+  - &vol-app ./:/app
+  - &vol-input
+    type: bind
+    source: ${HOST_INPUT_DIR:-./input/scene}
+    target: /data/input
+    read_only: true
+    bind: {create_host_path: false}
+  - &vol-output
+    type: bind
+    source: ${HOST_OUTPUT_DIR:-./output/scene}
+    target: /data/output
+    bind: {create_host_path: false}
+  - &vol-cache
+    type: bind
+    source: ${HOST_CACHE_DIR:-./.cache}
+    target: /home/app/.cache
+    bind: {create_host_path: false}
+  - &vol-orig
+    type: bind
+    source: ${HOST_ORIG_REPO:-./third_party/orig}
+    target: /orig
+    read_only: true
+    bind: {create_host_path: false}
+  - &vol-real-face
+    type: bind
+    source: ${HOST_REAL_FACE_DIR:-./data/real_face}
+    target: /data/real_face
+    read_only: true
+    bind: {create_host_path: false}
+  - &vol-anime-face
+    type: bind
+    source: ${HOST_ANIME_FACE_DIR:-./data/anime_face}
+    target: /data/anime_face
+    read_only: true
+    bind: {create_host_path: false}
+
+x-common: &common
+  <<: *gpu
+  build:
+    context: .
+    args:
+      BASE_IMAGE: ${BASE_IMAGE:-pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel}
+  image: sdedit-for-animeface:${IMAGE_TAG:-latest}
+  # ホストのユーザーで実行し、出力が root 所有にならないようにする
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  working_dir: /app
+  environment:
+    <<: *runtime-env
+  volumes: [*vol-app, *vol-input, *vol-output, *vol-cache]
+
+services:
+  shell:
+    <<: *common
+    entrypoint: ["/bin/bash"]
+    command: []
+    stdin_open: true
+    tty: true
+
+  # ① 68 点ランドマークの検出 (face_alignment: SFD -> 2DFAN4。画像ごとに最大の顔)。
+  #   docker compose run --rm landmarks --device cpu
+  landmarks:
+    <<: *common
+    entrypoint: ["python", "scripts/detect_face_landmarks.py",
+                 "--input_dir", "/data/input", "--out", "/data/output/landmarks.json"]
+    command: []
+
+  # ② 切り出し (既定は採用構成の head 方式・FFHQ の向き・頭の横の中心。ffhq 方式・回転なしも選べる)。
+  #   docker compose run --rm align --mode ffhq --out_dir /data/output/aligned_ffhq
+  #   docker compose run --rm align --rotation none --out_dir /data/output/aligned_rotnone
+  align:
+    <<: *common
+    entrypoint: ["python", "scripts/align_faces.py",
+                 "--input_dir", "/data/input", "--landmarks", "/data/output/landmarks.json",
+                 "--out_dir", "/data/output/aligned", "--mode", "head", "--rotation", "ffhq", "--center_x", "head"]
+    command: []
+
+  # ③ 顔パーシング (BiSeNet、CelebAMask-HQ の 19 クラス)。
+  #   docker compose run --rm parse --batch_size 8
+  parse:
+    <<: *common
+    entrypoint: ["python", "scripts/parse_faces.py",
+                 "--input_dir", "/data/output/aligned", "--out_dir", "/data/output/parse"]
+    command: []
+
+  # ④ 入力の加工 + ⑤ SDEdit。既定は採用構成 (scripts/sdedit_convert.py の argparse の既定値)。
+  #   docker compose run --rm convert --t0_ratio 0.4 --seed 1
+  #   docker compose run --rm convert --cond_pt /data/output/verify/orig_cond.pt --out_dir /data/output/verify/convert
+  convert:
+    <<: *common
+    environment:
+      <<: *runtime-env
+      MODEL_PATH: ${MODEL_PATH:-ddpm/anime-face256-mp128-ema_0.9995_250000.pt}
+      MODEL_CFG: ${MODEL_CFG:-ddpm/cfg/face256-mp128-ema_0.9995_250000.infer.cfg}
+      COLOR_STATS: ${COLOR_STATS:-lists/face_color_stats.json}
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        exec python scripts/sdedit_convert.py
+        --model_path "$$MODEL_PATH" --cfg "$$MODEL_CFG" --color_stats "$$COLOR_STATS"
+        --base_samples /data/output/aligned --stroke_parse_dir /data/output/parse
+        --out_dir /data/output/convert "$$@"
+      - sh
+    command: []
+
+  # ⑥ 元のフレームへの貼り戻し (quad の逆変換。外縁 8% でぼかし、頭部の部位のマスク (服を除く。4px 膨張、σ 4px))。
+  #   docker compose run --rm paste --feather 0.1
+  #   docker compose run --rm paste --run_dir /data/output/convert_t04 --out_dir /data/output/pasted_t04
+  paste:
+    <<: *common
+    entrypoint: ["python", "scripts/paste_back_faces.py",
+                 "--run_dir", "/data/output/convert", "--frames_dir", "/data/input",
+                 "--quads", "/data/output/aligned/quads.json", "--mask_parse_dir", "/data/output/parse",
+                 "--out_dir", "/data/output/pasted"]
+    command: []
+
+  # ① 〜 ⑥ の通し (scripts/run_pipeline.sh。段ごとに別のプロセスで動かす)。[opts] は convert (④⑤) に渡す。
+  # ①②③⑥ の追加の引数は LANDMARKS_OPTS などで、動かす段は STAGES で選ぶ (.env か -e で指定)。
+  #   docker compose run --rm pipeline
+  #   docker compose run --rm pipeline --t0_ratio 0.4 --out_dir /data/output/convert_t04   # ⑥ は convert_t04/pasted へ
+  #   docker compose run --rm -e STAGES="convert paste" -e PASTE_OPTS="--feather 0.1" pipeline
+  pipeline:
+    <<: *common
+    environment:
+      <<: *runtime-env
+      MODEL_PATH: ${MODEL_PATH:-ddpm/anime-face256-mp128-ema_0.9995_250000.pt}
+      MODEL_CFG: ${MODEL_CFG:-ddpm/cfg/face256-mp128-ema_0.9995_250000.infer.cfg}
+      COLOR_STATS: ${COLOR_STATS:-lists/face_color_stats.json}
+      STAGES: ${STAGES:-}
+      LANDMARKS_OPTS: ${LANDMARKS_OPTS:-}
+      ALIGN_OPTS: ${ALIGN_OPTS:-}
+      PARSE_OPTS: ${PARSE_OPTS:-}
+      PASTE_OPTS: ${PASTE_OPTS:-}
+    entrypoint: ["bash", "scripts/run_pipeline.sh"]
+    command: []
+
+  # 色の写像の統計の作り直し (実写: HOST_REAL_FACE_DIR、アニメ: HOST_ANIME_FACE_DIR)。
+  # 出力は /data/output/face_color_stats.json (lists/ の統計は上書きしない。使うときは COLOR_STATS で指定する)。
+  #   docker compose run --rm fit-color-stats --num 2000 --seed 1
+  fit-color-stats:
+    <<: *common
+    volumes: [*vol-app, *vol-input, *vol-output, *vol-cache, *vol-real-face, *vol-anime-face]
+    entrypoint: ["python", "scripts/fit_face_color_stats.py",
+                 "--real_dir", "/data/real_face", "--anime_dir", "/data/anime_face",
+                 "--exclude_list", "lists/face_color_stats_exclude.txt", "--out", "/data/output/face_color_stats.json"]
+    command: []
+
+  # 回帰確認 (diagnostics/verify.py)。最初の引数で比べる段を選ぶ。
+  #   docker compose run --rm verify sdedit --new_run /data/output/verify/convert
+  verify:
+    <<: *common
+    volumes: [*vol-app, *vol-input, *vol-output, *vol-cache, *vol-orig]
+    entrypoint: ["python", "diagnostics/verify.py", "--orig_root", "/orig"]
+    command: []
+
+  # 元リポジトリのコードを編集せずに読み込み、④ の float の入力を .pt に書き出す (diagnostics/export_orig_cond.py)。
+  # 元のコードは mpi4py と blobfile を import するので、元の実行のイメージ (ORIG_IMAGE) で動かす。
+  # このサービスはビルドしない (元のイメージを上書きしないよう、x-common の build を継がない)。
+  #   docker compose run --rm export-orig
+  # 移植した ⑤ を元のイメージで動かす (環境の差とコードの差を切り分ける):
+  #   docker compose run --rm --entrypoint python export-orig scripts/sdedit_convert.py \
+  #     --model_path ddpm/anime-face256-mp128-ema_0.9995_250000.pt --cfg ddpm/cfg/face256-mp128-ema_0.9995_250000.infer.cfg \
+  #     --cond_pt /data/output/verify/orig_cond.pt --out_dir /data/output/verify/convert_origimage
+  export-orig:
+    <<: *gpu
+    image: ${ORIG_IMAGE:-ilvr-anime-faceparts:latest}
+    pull_policy: never
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    working_dir: /app
+    environment:
+      <<: *runtime-env
+      HOME: /tmp
+      PYTHONPATH: /app
+    volumes: [*vol-app, *vol-output, *vol-orig]
+    entrypoint: ["python", "diagnostics/export_orig_cond.py", "--orig_root", "/orig",
+                 "--out", "/data/output/verify/orig_cond.pt"]
+    command: []

@@ -1,0 +1,13 @@
+diff --git a/.gitignore b/.gitignore
+index cb5608d..b154ae8 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -145,3 +145,8 @@ dmypy.json
+ 
+ # Cython debug symbols
+ cython_debug/
++
++# sdedit-for-animeface: シーンの入力と出力、チェックポイント（.env と .cache は上で無視済み）
++/input/
++/output/
++/ddpm/*.pt

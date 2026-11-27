@@ -1,0 +1,13 @@
+# animeface/ と scripts/ の依存 (Dockerfile でベースイメージ pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel に足す)。
+# torch / numpy / Pillow はベースイメージのものを使う (Dockerfile でベースの版を制約にして、更新されないようにする)。
+# 公式 SDEdit の requirements.txt (torch 1.5 など) は main.py 用で、このプロジェクトでは使わない。
+
+# ④ の CIELAB 変換と影の段 (gaussian_filter)、⑥ の部位のマスク (binary_dilation)。
+# 元の実行のイメージ (ilvr-anime-faceparts:latest) と同じ版 (④ の結果を一致させるため)
+scikit-image==0.24.0
+scipy==1.17.1
+
+# ① face_alignment の依存 (face-alignment 自体は Dockerfile で --no-deps で入れる)。
+# opencv-python (GUI 版、libGL が要る) の代わりに headless 版を入れる。版は anime-face-alignment のイメージと同じ
+opencv-python-headless==5.1.0.95
+numba==0.68.1

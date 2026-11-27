@@ -145,3 +145,8 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# sdedit-for-animeface: シーンの入力と出力、チェックポイント（.env と .cache は上で無視済み）
+/input/
+/output/
+/ddpm/*.pt
