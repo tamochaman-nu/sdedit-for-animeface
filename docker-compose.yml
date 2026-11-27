@@ -9,6 +9,9 @@
 #   docker compose run --rm paste [opts]         # ⑥ 貼り戻し         -> /data/output/pasted/
 #   docker compose run --rm pipeline [opts]      # ① 〜 ⑥ の通し ([opts] は convert へ。他の段は LANDMARKS_OPTS などの環境変数)
 #   docker compose run --rm fit-color-stats [opts]  # 色の写像の統計の作り直し -> /data/output/face_color_stats.json
+#   docker compose run --rm detect-eyes [opts]   # 出力の目の検出 (アニメ顔のランドマーク) -> /data/output/convert/anime_eyes.json
+#   docker compose run --rm eye-recolor [opts]   # 瞳の色を目標の色に寄せる (貼り戻しの前) -> /data/output/eyefix/
+#   docker compose run --rm stroke-eval [opts]   # 変換の評価 (アニメらしさ・構図のずれ・瞳の色のばらつき) -> /data/output/eval/
 #   docker compose run --rm verify <段> [opts]   # 回帰確認 (元リポジトリの出力と比べる。段: landmarks align parse cond sdedit paste)
 #   docker compose run --rm export-orig          # 元リポジトリのコードで ④ の float の入力を書き出す (回帰確認用)
 #
@@ -190,6 +193,46 @@ services:
     entrypoint: ["python", "scripts/fit_face_color_stats.py",
                  "--real_dir", "/data/real_face", "--anime_dir", "/data/anime_face",
                  "--exclude_list", "lists/face_color_stats_exclude.txt", "--out", "/data/output/face_color_stats.json"]
+    command: []
+
+  # 変換の出力 (アニメ顔) の目の検出 (scripts/detect_anime_eyes.py。hysts/anime-face-detector の 28 点)。
+  # 検出器は mmcv などに依存するので、このイメージには入れず anime-face-alignment のイメージ (ANIME_FA_IMAGE) で動かす
+  # (ビルドはしない)。別の実行には --input_dir と --out を [opts] で上書きする。
+  #   docker compose run --rm detect-eyes
+  #   docker compose run --rm detect-eyes --input_dir /data/output/convert_t04/samples --out /data/output/convert_t04/anime_eyes.json
+  detect-eyes:
+    <<: *gpu
+    image: ${ANIME_FA_IMAGE:-anime-face-alignment:latest}
+    pull_policy: never
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    working_dir: /app
+    environment:
+      <<: *runtime-env
+      HOME: /tmp
+    volumes: [*vol-app, *vol-output]
+    entrypoint: ["python", "scripts/detect_anime_eyes.py",
+                 "--input_dir", "/data/output/convert/samples", "--out", "/data/output/convert/anime_eyes.json"]
+    command: []
+
+  # 瞳の色を全ビューで同じ目標の色に寄せる (scripts/eye_recolor.py。貼り戻しの前の 256px)。先に detect-eyes を動かす。
+  # 出力は実行のディレクトリと同じ並びなので、貼り戻しは pipeline の paste で行う。
+  #   docker compose run --rm eye-recolor [--target_ab -5,-20] [--strength 0.5]
+  #   docker compose run --rm -e STAGES=paste pipeline --out_dir /data/output/eyefix   # -> /data/output/eyefix/pasted
+  eye-recolor:
+    <<: *common
+    entrypoint: ["python", "scripts/eye_recolor.py", "--run_dir", "/data/output/convert",
+                 "--eyes_json", "/data/output/convert/anime_eyes.json", "--out_dir", "/data/output/eyefix"]
+    command: []
+
+  # 変換の結果の評価 (diagnostics/stroke_eval.py)。アニメらしさ (分類器 diagnostics/assets/anime_score.pt)、
+  # 構図のずれ (lf16_lum)、瞳の色のばらつき (/data/output/parse の目のラベルから)。--runs と --out は [opts] で上書きする。
+  #   docker compose run --rm stroke-eval
+  #   docker compose run --rm stroke-eval --runs SD=/data/output/convert,T04=/data/output/convert_t04 \
+  #       --out /data/output/eval/t0 --grid all=SD,T04 --per_image
+  stroke-eval:
+    <<: *common
+    entrypoint: ["python", "diagnostics/stroke_eval.py", "--parse_dir", "/data/output/parse",
+                 "--runs", "SD=/data/output/convert", "--out", "/data/output/eval/stroke"]
     command: []
 
   # 回帰確認 (diagnostics/verify.py)。最初の引数で比べる段を選ぶ。

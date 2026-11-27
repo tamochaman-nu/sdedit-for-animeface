@@ -2,7 +2,7 @@
 切り出した実写の顔 (scripts/align_faces.py の出力) を、④ 入力の加工 -> ⑤ SDEdit でアニメ調に変換する。
 既定値は採用構成 (ilvr-for-anime-faceparts の outputs/sample04_stroke/parts2eye/SD/config.json の args):
   間引き 100 ステップ、t0_ratio 0.5 (間引き後の番号 49 = 元の過程の t 494 から 50 ステップ)、K=1、ILVR なし、
-  マスク合成なし、clip_denoised=True、全入力で同じシード 0、バッチ 16。
+  マスク合成なし、clip_denoised=True、全入力で同じシード 0 (--seed_per_file で入力ごとに変える)、バッチ 16。
 ループは animeface/sdedit.py。scripts/sdedit_sample.py (元リポジトリ) の該当部分を書き写した。
 
 ④ 入力の加工 (animeface/face_input_transform.py。元の sdedit_sample.py 152-198 行目と同じ順序):
@@ -41,7 +41,7 @@ from animeface.color_transfer import COLOR_TRANSFER_CHOICES, ColorTransfer  # no
 from animeface.face_input_transform import transform_input  # noqa: E402
 from animeface.image_io import list_images, load_image, save_png, str2bool  # noqa: E402
 from animeface.model import create_diffusion_from_cfg, load_model, read_cfg  # noqa: E402
-from animeface.sdedit import SampleRNG, sdedit_sample, sdedit_t0, start_info  # noqa: E402
+from animeface.sdedit import SampleRNG, sample_seed, sdedit_sample, sdedit_t0, start_info  # noqa: E402
 
 
 def main():
@@ -94,13 +94,15 @@ def main():
     for st in range(0, len(names), args.batch_size):
         idx = list(range(st, min(st + args.batch_size, len(names))))
         c0 = cond_all[idx].to(device)
-        rng = SampleRNG([args.seed] * len(idx), device)  # 全入力で同じノイズ列
+        # 既定は全入力で同じノイズ列。--seed_per_file ではシードと入力のファイル名から入力ごとに決める
+        seeds = [sample_seed(args.seed, names[i]) if args.seed_per_file else args.seed for i in idx]
+        rng = SampleRNG(seeds, device)
         x = sdedit_sample(diffusion, model, c0, t0, rng=rng, clip_denoised=args.clip_denoised,
                           progress=args.progress)
         for j, i in enumerate(idx):
             out = os.path.join("samples", f"{stems[i]}.png")
             save_png(x[j], os.path.join(args.out_dir, out))
-            o = {"input": names[i], "sample": out, "noise_seed": args.seed}
+            o = {"input": names[i], "sample": out, "noise_seed": seeds[j]}
             if not args.cond_pt:
                 o.update(ref_png=os.path.join("refs", f"{stems[i]}.png"),
                          cond_png=os.path.join("refs_cond", f"{stems[i]}.png"))
@@ -153,7 +155,8 @@ def create_argparser():
     p.add_argument("--save_cond_pt", default="", help="④ の float の出力を書き出す .pt")
     p.add_argument("--timestep_respacing", default="100")
     p.add_argument("--t0_ratio", type=float, default=0.5, help="t0 = max(1, int(t0_ratio * T))。番号 t0-1 から t0 ステップ")
-    p.add_argument("--seed", type=int, default=0, help="乱数のシード (全ての入力で同じノイズ列)")
+    p.add_argument("--seed", type=int, default=0, help="乱数のシード (既定では全ての入力で同じノイズ列)")
+    flag("seed_per_file", False, "入力ごとにシードを変える (シードとファイル名から決める。元の sdedit_sample.py と同じ乱数)")
     flag("clip_denoised", True, "x0 の予測を [-1, 1] に切り詰める")
     flag("progress", False, "")
     p.add_argument("--batch_size", type=int, default=16)

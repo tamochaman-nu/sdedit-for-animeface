@@ -15,7 +15,16 @@ alphas_cumprod[i] (= 元の過程の alphas_cumprod[timestep_map[i]]) を使い�
 公式 SDEdit (runners/image_editing.py) との違いは README.md の表を参照。
 """
 
+import zlib
+
+import numpy as np
 import torch as th
+
+
+def sample_seed(seed, name):
+    """シードと入力のファイル名から、その入力用のシードを決める (入力の組や順序によらない)。
+    元リポジトリの guided_diffusion/ilvr_eye.py 154-156 の sample_seed と同じ。"""
+    return int(np.random.SeedSequence([seed, zlib.crc32(name.encode())]).generate_state(1, np.uint64)[0] >> 1)
 
 
 def sdedit_t0(t0_ratio, num_timesteps):

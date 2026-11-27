@@ -11,3 +11,7 @@ scipy==1.17.1
 # opencv-python (GUI 版、libGL が要る) の代わりに headless 版を入れる。版は anime-face-alignment のイメージと同じ
 opencv-python-headless==5.1.0.95
 numba==0.68.1
+
+# diagnostics/anime_score.py (アニメらしさの分類器) の Inception-v3 の特徴。
+# 元の実行のイメージ (ilvr-anime-faceparts:latest) と同じ版 (分類器を学習した特徴と一致させるため)
+torch-fidelity==0.3.0
